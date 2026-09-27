@@ -10,9 +10,11 @@ jobs:
     env:
       SOURCE_PROJECT_REF: ${{ vars.SOURCE_PROJECT_REF }}
       TARGET_PROJECT_REF: ${{ vars.TARGET_PROJECT_REF }}
+      # Migration reported by Supabase as present remotely but missing locally.
+      # This repair changes migration HISTORY only; it does not run or delete SQL.
+      SOURCE_REPAIR_MIGRATION: "20260906033346"
 
     steps:
-
       # ============================================================
       # 1. CHECKOUT
       # ============================================================
@@ -51,6 +53,7 @@ jobs:
           echo "=========================================="
           echo "SOURCE : $SOURCE_PROJECT_REF"
           echo "TARGET : $TARGET_PROJECT_REF"
+          echo "SOURCE HISTORY REPAIR : $SOURCE_REPAIR_MIGRATION"
           echo "=========================================="
 
       # ============================================================
@@ -87,19 +90,68 @@ jobs:
           echo "SOURCE linked successfully."
 
       # ============================================================
-      # 7. SOURCE MIGRATION HISTORY
+      # 7. SOURCE MIGRATION HISTORY BEFORE REPAIR
       # ============================================================
 
-      - name: Check SOURCE Migration History
+      - name: Check SOURCE Migration History Before Repair
         run: |
           set -e
 
-          echo "SOURCE migration history:"
+          echo "=========================================="
+          echo "SOURCE MIGRATION HISTORY - BEFORE REPAIR"
+          echo "=========================================="
 
           supabase migration list
 
       # ============================================================
-      # 8. PULL SOURCE SCHEMA
+      # 8. REPAIR SOURCE HISTORY
+      #
+      # The SOURCE database reports migration 20260906033346 as
+      # applied, but the local repository does not contain that
+      # migration. Marking it reverted changes ONLY the migration
+      # history table. It does NOT undo database schema changes.
+      #
+      # db pull will then capture the current SOURCE schema into a
+      # new local migration file.
+      # ============================================================
+
+      - name: Repair SOURCE Migration History
+        run: |
+          set -e
+
+          echo "=========================================="
+          echo "REPAIRING SOURCE MIGRATION HISTORY"
+          echo "=========================================="
+
+          if supabase migration list | grep -q "$SOURCE_REPAIR_MIGRATION"; then
+            echo "Repairing migration: $SOURCE_REPAIR_MIGRATION"
+
+            supabase migration repair \
+              "$SOURCE_REPAIR_MIGRATION" \
+              --status reverted
+
+            echo "SOURCE migration history repaired."
+          else
+            echo "Migration $SOURCE_REPAIR_MIGRATION was not found."
+            echo "No repair required."
+          fi
+
+      # ============================================================
+      # 9. VERIFY SOURCE HISTORY AFTER REPAIR
+      # ============================================================
+
+      - name: Check SOURCE Migration History After Repair
+        run: |
+          set -e
+
+          echo "=========================================="
+          echo "SOURCE MIGRATION HISTORY - AFTER REPAIR"
+          echo "=========================================="
+
+          supabase migration list
+
+      # ============================================================
+      # 10. PULL SOURCE SCHEMA
       # ============================================================
 
       - name: Pull SOURCE Schema
@@ -124,7 +176,7 @@ jobs:
             | sort
 
       # ============================================================
-      # 9. DISPLAY SCHEMA OBJECTS
+      # 11. DISPLAY SCHEMA OBJECTS
       # ============================================================
 
       - name: Inspect SOURCE Schema
@@ -171,7 +223,7 @@ jobs:
             supabase/migrations/*.sql || true
 
       # ============================================================
-      # 10. LOGIN TARGET
+      # 12. LOGIN TARGET
       # ============================================================
 
       - name: Login to TARGET
@@ -186,7 +238,7 @@ jobs:
           echo "TARGET login successful."
 
       # ============================================================
-      # 11. LINK TARGET
+      # 13. LINK TARGET
       # ============================================================
 
       - name: Link TARGET Project
@@ -204,19 +256,21 @@ jobs:
           echo "TARGET linked successfully."
 
       # ============================================================
-      # 12. TARGET MIGRATION HISTORY
+      # 14. TARGET MIGRATION HISTORY
       # ============================================================
 
       - name: Check TARGET Migration History
         run: |
           set -e
 
-          echo "TARGET migration history:"
+          echo "=========================================="
+          echo "TARGET MIGRATION HISTORY"
+          echo "=========================================="
 
           supabase migration list
 
       # ============================================================
-      # 13. PUSH DATABASE SCHEMA
+      # 15. PUSH DATABASE SCHEMA TO TARGET
       # ============================================================
 
       - name: Push Database Schema to TARGET
@@ -232,7 +286,7 @@ jobs:
           echo "Database schema migration completed."
 
       # ============================================================
-      # 14. VERIFY DATABASE MIGRATION
+      # 16. VERIFY DATABASE MIGRATION
       # ============================================================
 
       - name: Verify Database Migration
@@ -246,7 +300,7 @@ jobs:
           supabase migration list
 
       # ============================================================
-      # 15. CHECK EDGE FUNCTIONS IN REPOSITORY
+      # 17. CHECK EDGE FUNCTIONS IN REPOSITORY
       # ============================================================
 
       - name: Check Edge Functions
@@ -268,7 +322,7 @@ jobs:
             | sort
 
       # ============================================================
-      # 16. DEPLOY EDGE FUNCTIONS
+      # 18. DEPLOY EDGE FUNCTIONS
       # ============================================================
 
       - name: Deploy Edge Functions
@@ -317,7 +371,7 @@ jobs:
           fi
 
       # ============================================================
-      # 17. STORAGE BUCKET LIST
+      # 19. STORAGE CONFIGURATION
       # ============================================================
 
       - name: Check Storage Configuration
@@ -326,11 +380,11 @@ jobs:
           echo "STORAGE"
           echo "=========================================="
 
-          echo "Storage bucket migration is handled separately."
-          echo "Database metadata for storage is already part of the schema."
+          echo "Storage bucket/object files are handled separately."
+          echo "Database metadata for storage is included in the schema."
 
       # ============================================================
-      # 18. FINAL MIGRATION SUMMARY
+      # 20. FINAL MIGRATION SUMMARY
       # ============================================================
 
       - name: Migration Summary
@@ -361,7 +415,7 @@ jobs:
           echo "=========================================="
 
       # ============================================================
-      # 19. CLEANUP
+      # 21. CLEANUP
       # ============================================================
 
       - name: Cleanup
