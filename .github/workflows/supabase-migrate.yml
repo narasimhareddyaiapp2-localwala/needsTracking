@@ -127,8 +127,8 @@ jobs:
             echo "Repairing migration: $SOURCE_REPAIR_MIGRATION"
 
             supabase migration repair \
-              "$SOURCE_REPAIR_MIGRATION" \
-              --status reverted
+              --status reverted \
+              "$SOURCE_REPAIR_MIGRATION"
 
             echo "SOURCE migration history repaired."
           else
@@ -164,7 +164,7 @@ jobs:
 
           mkdir -p supabase/migrations
 
-          supabase db pull
+          supabase db pull --diff-engine migra
 
           echo ""
           echo "Generated migration files:"
