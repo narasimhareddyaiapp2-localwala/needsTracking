@@ -1,7 +1,11 @@
+
 name: Supabase Complete Migration
 
 on:
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   migrate:
@@ -10,19 +14,25 @@ jobs:
     env:
       SOURCE_PROJECT_REF: ${{ vars.SOURCE_PROJECT_REF }}
       TARGET_PROJECT_REF: ${{ vars.TARGET_PROJECT_REF }}
-      # Migration reported by Supabase as present remotely but missing locally.
-      # This repair changes migration HISTORY only; it does not run or delete SQL.
-      SOURCE_REPAIR_MIGRATION: "20260906033346"
+
+      # Migration reported as existing remotely but missing locally.
+      SOURCE_REPAIR_MIGRATION: ${{ vars.SOURCE_REPAIR_MIGRATION }}
+
+      # SAFETY SWITCH:
+      # false = detect mismatch but DO NOT repair
+      # true  = explicitly allow repair of SOURCE_REPAIR_MIGRATION
+      ALLOW_SOURCE_HISTORY_REPAIR: ${{ vars.ALLOW_SOURCE_HISTORY_REPAIR }}
 
     steps:
+
       # ============================================================
-      # 1. CHECKOUT
+      # 1. CHECKOUT REPOSITORY
       # ============================================================
 
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
-          persist-credentials: false
+          persist-credentials: true
 
       # ============================================================
       # 2. SUPABASE CLI
@@ -39,8 +49,13 @@ jobs:
 
       - name: Install PostgreSQL Client
         run: |
+          set -euo pipefail
+
           sudo apt-get update
           sudo apt-get install -y postgresql-client
+
+          echo "PostgreSQL client:"
+          psql --version
 
       # ============================================================
       # 4. SHOW CONFIGURATION
@@ -48,38 +63,114 @@ jobs:
 
       - name: Show Migration Configuration
         run: |
+          set -euo pipefail
+
           echo "=========================================="
-          echo "SUPABASE MIGRATION"
+          echo "SUPABASE COMPLETE MIGRATION"
           echo "=========================================="
-          echo "SOURCE : $SOURCE_PROJECT_REF"
-          echo "TARGET : $TARGET_PROJECT_REF"
-          echo "SOURCE HISTORY REPAIR : $SOURCE_REPAIR_MIGRATION"
+          echo ""
+
+          echo "SOURCE PROJECT:"
+          echo "$SOURCE_PROJECT_REF"
+
+          echo ""
+          echo "TARGET PROJECT:"
+          echo "$TARGET_PROJECT_REF"
+
+          echo ""
+          echo "SOURCE REPAIR MIGRATION:"
+          echo "${SOURCE_REPAIR_MIGRATION:-NOT SET}"
+
+          echo ""
+          echo "HISTORY REPAIR ENABLED:"
+          echo "${ALLOW_SOURCE_HISTORY_REPAIR:-false}"
+
+          echo ""
+          echo "SUPABASE CLI:"
+          supabase --version
+
+          echo ""
           echo "=========================================="
 
       # ============================================================
-      # 5. LOGIN SOURCE
+      # 5. CHECK SUPABASE CONFIG
+      # ============================================================
+
+      - name: Check Supabase Config
+        run: |
+          set -euo pipefail
+
+          echo "=========================================="
+          echo "SUPABASE CONFIGURATION"
+          echo "=========================================="
+
+          if [ -f "supabase/config.toml" ]; then
+
+            echo "supabase/config.toml found."
+            echo ""
+
+            if grep -q '^\[experimental.pgdelta\]' supabase/config.toml; then
+
+              echo "pg-delta configuration detected:"
+              grep -A 3 '^\[experimental.pgdelta\]' \
+                supabase/config.toml || true
+
+            else
+
+              echo "No pg-delta configuration detected."
+              echo "Workflow will explicitly use migra."
+
+            fi
+
+          else
+
+            echo "WARNING: supabase/config.toml not found."
+
+          fi
+
+          echo ""
+          echo "=========================================="
+
+      # ============================================================
+      # 6. LOGIN SOURCE
       # ============================================================
 
       - name: Login to SOURCE
         env:
           SOURCE_SUPABASE_ACCESS_TOKEN: ${{ secrets.SOURCE_SUPABASE_ACCESS_TOKEN }}
         run: |
-          set -e
+          set -euo pipefail
+
+          if [ -z "${SOURCE_SUPABASE_ACCESS_TOKEN:-}" ]; then
+            echo "::error::SOURCE_SUPABASE_ACCESS_TOKEN is empty."
+            exit 1
+          fi
 
           echo "Logging into SOURCE..."
 
           supabase login \
             --token "$SOURCE_SUPABASE_ACCESS_TOKEN"
 
+          echo "SOURCE login successful."
+
       # ============================================================
-      # 6. LINK SOURCE
+      # 7. LINK SOURCE
       # ============================================================
 
       - name: Link SOURCE Project
         env:
           SOURCE_DB_PASSWORD: ${{ secrets.SOURCE_DB_PASSWORD }}
         run: |
-          set -e
+          set -euo pipefail
+
+          if [ -z "${SOURCE_DB_PASSWORD:-}" ]; then
+            echo "::error::SOURCE_DB_PASSWORD is empty."
+            exit 1
+          fi
+
+          echo "=========================================="
+          echo "LINKING SOURCE PROJECT"
+          echo "=========================================="
 
           rm -rf .supabase
 
@@ -90,73 +181,255 @@ jobs:
           echo "SOURCE linked successfully."
 
       # ============================================================
-      # 7. SOURCE MIGRATION HISTORY BEFORE REPAIR
+      # 8. CHECK SOURCE MIGRATION HISTORY
       # ============================================================
 
-      - name: Check SOURCE Migration History Before Repair
+      - name: Check SOURCE Migration History
+        id: source_history_check
         run: |
-          set -e
+          set -euo pipefail
 
           echo "=========================================="
-          echo "SOURCE MIGRATION HISTORY - BEFORE REPAIR"
+          echo "SOURCE MIGRATION HISTORY"
           echo "=========================================="
 
-          supabase migration list
+          if [ -z "${SOURCE_REPAIR_MIGRATION:-}" ]; then
+            echo ""
+            echo "SOURCE_REPAIR_MIGRATION is not configured."
+            echo "No history repair will be attempted."
+            echo "repair_needed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! [[ "$SOURCE_REPAIR_MIGRATION" =~ ^[0-9]{14}$ ]]; then
+            echo "::error::SOURCE_REPAIR_MIGRATION must be a 14-digit timestamp."
+            echo "Example: 20260906033346"
+            exit 1
+          fi
+
+          echo ""
+          echo "Checking local migration files..."
+
+          LOCAL_MATCHES="$(
+            find supabase/migrations \
+              -maxdepth 1 \
+              -type f \
+              -name "${SOURCE_REPAIR_MIGRATION}_*.sql" \
+              -print || true
+          )"
+
+          if [ -n "$LOCAL_MATCHES" ]; then
+            echo ""
+            echo "::error::Migration $SOURCE_REPAIR_MIGRATION already exists locally."
+            echo ""
+            echo "$LOCAL_MATCHES"
+            echo ""
+            echo "STOPPING."
+            echo "A history repair is NOT appropriate when the local migration exists."
+            exit 1
+          fi
+
+          echo "Local migration is missing."
+
+          echo ""
+          echo "Reading SOURCE migration history..."
+
+          HISTORY_OUTPUT="$(supabase migration list)"
+
+          echo "$HISTORY_OUTPUT"
+
+          if ! echo "$HISTORY_OUTPUT" |
+            grep -Eq "(^|[^0-9])${SOURCE_REPAIR_MIGRATION}([^0-9]|$)"; then
+
+            echo ""
+            echo "Migration $SOURCE_REPAIR_MIGRATION was not found remotely."
+            echo "No history repair is required."
+
+            echo "repair_needed=false" >> "$GITHUB_OUTPUT"
+
+            exit 0
+          fi
+
+          echo ""
+          echo "Remote migration was found:"
+          echo "$SOURCE_REPAIR_MIGRATION"
+
+          echo ""
+          echo "The migration is missing locally but exists remotely."
+
+          if [ "${ALLOW_SOURCE_HISTORY_REPAIR:-false}" != "true" ]; then
+
+            echo ""
+            echo "=========================================="
+            echo "SAFE MODE - NO REPAIR"
+            echo "=========================================="
+            echo ""
+            echo "History repair is currently DISABLED."
+            echo ""
+            echo "Detected:"
+            echo "  Remote migration : $SOURCE_REPAIR_MIGRATION"
+            echo "  Local migration  : missing"
+            echo ""
+            echo "To intentionally repair this migration:"
+            echo ""
+            echo "GitHub Repository"
+            echo "  → Settings"
+            echo "  → Secrets and variables"
+            echo "  → Actions"
+            echo "  → Variables"
+            echo ""
+            echo "Set:"
+            echo "  ALLOW_SOURCE_HISTORY_REPAIR=true"
+            echo ""
+            echo "Then run the workflow again."
+            echo ""
+            echo "No migration history has been changed."
+
+            echo "repair_needed=false" >> "$GITHUB_OUTPUT"
+
+            exit 0
+          fi
+
+          echo ""
+          echo "=========================================="
+          echo "EXPLICIT REPAIR PERMISSION DETECTED"
+          echo "=========================================="
+          echo ""
+          echo "Migration:"
+          echo "$SOURCE_REPAIR_MIGRATION"
+          echo ""
+          echo "Local migration:"
+          echo "MISSING"
+          echo ""
+          echo "Remote migration:"
+          echo "FOUND"
+          echo ""
+          echo "Repair is explicitly enabled."
+
+          echo "repair_needed=true" >> "$GITHUB_OUTPUT"
 
       # ============================================================
-      # 8. REPAIR SOURCE HISTORY
+      # 9. BACKUP SOURCE MIGRATION HISTORY
+      # ============================================================
+
+      - name: Backup SOURCE Migration History
+        if: steps.source_history_check.outputs.repair_needed == 'true'
+        run: |
+          set -euo pipefail
+
+          echo "=========================================="
+          echo "BACKING UP SOURCE MIGRATION HISTORY"
+          echo "=========================================="
+
+          mkdir -p migration-history-backup
+
+          supabase migration list \
+            | tee migration-history-backup/source-before-repair.txt
+
+          echo ""
+          echo "Backup created:"
+          echo "migration-history-backup/source-before-repair.txt"
+
+      # ============================================================
+      # 10. REPAIR SOURCE HISTORY
       #
-      # The SOURCE database reports migration 20260906033346 as
-      # applied, but the local repository does not contain that
-      # migration. Marking it reverted changes ONLY the migration
-      # history table. It does NOT undo database schema changes.
+      # THIS IS THE ONLY STEP THAT MODIFIES MIGRATION HISTORY.
       #
-      # db pull will then capture the current SOURCE schema into a
-      # new local migration file.
+      # It does NOT:
+      #   - drop tables
+      #   - delete rows
+      #   - undo schema
+      #   - execute old migration SQL
       # ============================================================
 
       - name: Repair SOURCE Migration History
+        if: steps.source_history_check.outputs.repair_needed == 'true'
         run: |
-          set -e
+          set -euo pipefail
 
           echo "=========================================="
           echo "REPAIRING SOURCE MIGRATION HISTORY"
           echo "=========================================="
 
-          if supabase migration list | grep -q "$SOURCE_REPAIR_MIGRATION"; then
-            echo "Repairing migration: $SOURCE_REPAIR_MIGRATION"
+          echo ""
+          echo "Migration:"
+          echo "$SOURCE_REPAIR_MIGRATION"
 
-            supabase migration repair \
-              --status reverted \
-              "$SOURCE_REPAIR_MIGRATION"
+          echo ""
+          echo "This changes migration history metadata only."
+          echo "It does NOT modify database tables or data."
 
-            echo "SOURCE migration history repaired."
-          else
-            echo "Migration $SOURCE_REPAIR_MIGRATION was not found."
-            echo "No repair required."
+          echo ""
+          echo "Running migration repair..."
+
+          supabase migration repair \
+            --status reverted \
+            "$SOURCE_REPAIR_MIGRATION"
+
+          echo ""
+          echo "Migration history repair command completed."
+
+      # ============================================================
+      # 11. VERIFY SOURCE HISTORY REPAIR
+      # ============================================================
+
+      - name: Verify SOURCE Migration History Repair
+        if: steps.source_history_check.outputs.repair_needed == 'true'
+        run: |
+          set -euo pipefail
+
+          echo "=========================================="
+          echo "VERIFYING SOURCE HISTORY REPAIR"
+          echo "=========================================="
+
+          supabase migration list \
+            | tee migration-history-backup/source-after-repair.txt
+
+          echo ""
+          echo "Migration history after repair:"
+          cat migration-history-backup/source-after-repair.txt
+
+          echo ""
+          echo "Checking repaired migration..."
+
+          MATCHED_LINE="$(
+            grep -E "(^|[^0-9])${SOURCE_REPAIR_MIGRATION}([^0-9]|$)" \
+              migration-history-backup/source-after-repair.txt \
+              | head -n 1 || true
+          )"
+
+          if [ -z "$MATCHED_LINE" ]; then
+            echo ""
+            echo "Migration no longer appears in migration history."
+            echo "This is acceptable."
+            exit 0
           fi
 
+          echo ""
+          echo "Matched line:"
+          echo "$MATCHED_LINE"
+
+          if echo "$MATCHED_LINE" | grep -qi "reverted"; then
+            echo ""
+            echo "SUCCESS:"
+            echo "$SOURCE_REPAIR_MIGRATION is marked reverted."
+            exit 0
+          fi
+
+          echo ""
+          echo "::error::Migration $SOURCE_REPAIR_MIGRATION does not appear reverted."
+          echo "Stopping before schema pull."
+          exit 1
+
       # ============================================================
-      # 9. VERIFY SOURCE HISTORY AFTER REPAIR
-      # ============================================================
-
-      - name: Check SOURCE Migration History After Repair
-        run: |
-          set -e
-
-          echo "=========================================="
-          echo "SOURCE MIGRATION HISTORY - AFTER REPAIR"
-          echo "=========================================="
-
-          supabase migration list
-
-      # ============================================================
-      # 10. PULL SOURCE SCHEMA
+      # 12. PULL SOURCE SCHEMA
       # ============================================================
 
       - name: Pull SOURCE Schema
+        env:
+          PGDELTA_DEBUG: "1"
         run: |
-          set -e
+          set -euo pipefail
 
           echo "=========================================="
           echo "PULLING SOURCE SCHEMA"
@@ -164,30 +437,59 @@ jobs:
 
           mkdir -p supabase/migrations
 
-          supabase db pull --diff-engine migra
+          echo ""
+          echo "Running:"
+          echo "supabase db pull --diff-engine migra --debug"
+          echo ""
+
+          supabase db pull \
+            --diff-engine migra \
+            --debug
 
           echo ""
-          echo "Generated migration files:"
+          echo "=========================================="
+          echo "GENERATED MIGRATION FILES"
+          echo "=========================================="
 
-          find supabase/migrations \
-            -maxdepth 1 \
-            -type f \
-            -printf "%f\n" \
-            | sort
+          if compgen -G "supabase/migrations/*.sql" > /dev/null; then
+
+            find supabase/migrations \
+              -maxdepth 1 \
+              -type f \
+              -name "*.sql" \
+              -printf "%f\n" \
+              | sort
+
+          else
+
+            echo "No SQL migration files generated."
+
+          fi
 
       # ============================================================
-      # 11. DISPLAY SCHEMA OBJECTS
+      # 13. INSPECT GENERATED SCHEMA
       # ============================================================
 
       - name: Inspect SOURCE Schema
         run: |
-          set -e
+          set -euo pipefail
 
+          echo "=========================================="
+          echo "SOURCE SCHEMA INSPECTION"
+          echo "=========================================="
+
+          if ! compgen -G "supabase/migrations/*.sql" > /dev/null; then
+            echo "No SQL migration files found."
+            exit 0
+          fi
+
+          echo ""
           echo "=========================================="
           echo "TABLES"
           echo "=========================================="
 
-          grep -iE 'CREATE TABLE' \
+          grep -iE \
+            'CREATE TABLE' \
             supabase/migrations/*.sql || true
 
           echo ""
@@ -195,7 +497,8 @@ jobs:
           echo "FUNCTIONS"
           echo "=========================================="
 
-          grep -iE 'CREATE (OR REPLACE )?FUNCTION' \
+          grep -iE \
+            'CREATE (OR REPLACE )?FUNCTION' \
             supabase/migrations/*.sql || true
 
           echo ""
@@ -203,7 +506,8 @@ jobs:
           echo "TRIGGERS"
           echo "=========================================="
 
-          grep -iE 'CREATE TRIGGER' \
+          grep -iE \
+            'CREATE TRIGGER' \
             supabase/migrations/*.sql || true
 
           echo ""
@@ -211,7 +515,8 @@ jobs:
           echo "POLICIES"
           echo "=========================================="
 
-          grep -iE 'CREATE POLICY' \
+          grep -iE \
+            'CREATE POLICY' \
             supabase/migrations/*.sql || true
 
           echo ""
@@ -219,18 +524,96 @@ jobs:
           echo "VIEWS"
           echo "=========================================="
 
-          grep -iE 'CREATE (OR REPLACE )?VIEW' \
+          grep -iE \
+            'CREATE (OR REPLACE )?VIEW' \
+            supabase/migrations/*.sql || true
+
+          echo ""
+          echo "=========================================="
+          echo "INDEXES"
+          echo "=========================================="
+
+          grep -iE \
+            'CREATE .*INDEX' \
             supabase/migrations/*.sql || true
 
       # ============================================================
-      # 12. LOGIN TARGET
+      # 14. SAVE GENERATED MIGRATION TO GITHUB
+      # ============================================================
+
+      - name: Save Generated Migration to Repository
+        run: |
+          set -euo pipefail
+
+          echo "=========================================="
+          echo "SAVING GENERATED MIGRATION TO GITHUB"
+          echo "=========================================="
+
+          if ! compgen -G "supabase/migrations/*.sql" > /dev/null; then
+            echo "No migration files found."
+            echo "Nothing to commit."
+            exit 0
+          fi
+
+          echo ""
+          echo "Migration files:"
+          find supabase/migrations \
+            -maxdepth 1 \
+            -type f \
+            -name "*.sql" \
+            -printf "%f\n" \
+            | sort
+
+          echo ""
+          echo "Git status BEFORE commit:"
+          git status --short
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add supabase/migrations/*.sql
+
+          if git diff --cached --quiet; then
+            echo ""
+            echo "No migration changes detected."
+            echo "Nothing to commit."
+            exit 0
+          fi
+
+          echo ""
+          echo "Changes to be committed:"
+          git diff --cached --stat
+
+          echo ""
+          echo "Creating commit..."
+
+          git commit \
+            -m "chore: save generated Supabase migration"
+
+          echo ""
+          echo "Pushing migration to GitHub..."
+
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+          echo ""
+          echo "Migration saved successfully."
+
+      # ============================================================
+      # 15. LOGIN TARGET
       # ============================================================
 
       - name: Login to TARGET
         env:
           TARGET_SUPABASE_ACCESS_TOKEN: ${{ secrets.TARGET_SUPABASE_ACCESS_TOKEN }}
         run: |
-          set -e
+          set -euo pipefail
+
+          if [ -z "${TARGET_SUPABASE_ACCESS_TOKEN:-}" ]; then
+            echo "::error::TARGET_SUPABASE_ACCESS_TOKEN is empty."
+            exit 1
+          fi
+
+          echo "Logging into TARGET..."
 
           supabase login \
             --token "$TARGET_SUPABASE_ACCESS_TOKEN"
@@ -238,14 +621,23 @@ jobs:
           echo "TARGET login successful."
 
       # ============================================================
-      # 13. LINK TARGET
+      # 16. LINK TARGET
       # ============================================================
 
       - name: Link TARGET Project
         env:
           TARGET_DB_PASSWORD: ${{ secrets.TARGET_DB_PASSWORD }}
         run: |
-          set -e
+          set -euo pipefail
+
+          if [ -z "${TARGET_DB_PASSWORD:-}" ]; then
+            echo "::error::TARGET_DB_PASSWORD is empty."
+            exit 1
+          fi
+
+          echo "=========================================="
+          echo "LINKING TARGET PROJECT"
+          echo "=========================================="
 
           rm -rf .supabase
 
@@ -256,12 +648,12 @@ jobs:
           echo "TARGET linked successfully."
 
       # ============================================================
-      # 14. TARGET MIGRATION HISTORY
+      # 17. TARGET MIGRATION HISTORY
       # ============================================================
 
       - name: Check TARGET Migration History
         run: |
-          set -e
+          set -euo pipefail
 
           echo "=========================================="
           echo "TARGET MIGRATION HISTORY"
@@ -270,41 +662,44 @@ jobs:
           supabase migration list
 
       # ============================================================
-      # 15. PUSH DATABASE SCHEMA TO TARGET
+      # 18. PUSH DATABASE SCHEMA TO TARGET
       # ============================================================
 
       - name: Push Database Schema to TARGET
         run: |
-          set -e
+          set -euo pipefail
 
           echo "=========================================="
-          echo "PUSHING DATABASE SCHEMA"
+          echo "PUSHING DATABASE SCHEMA TO TARGET"
           echo "=========================================="
 
           supabase db push
 
+          echo ""
           echo "Database schema migration completed."
 
       # ============================================================
-      # 16. VERIFY DATABASE MIGRATION
+      # 19. VERIFY TARGET MIGRATION
       # ============================================================
 
-      - name: Verify Database Migration
+      - name: Verify TARGET Migration
         run: |
-          set -e
+          set -euo pipefail
 
           echo "=========================================="
-          echo "TARGET MIGRATION HISTORY"
+          echo "TARGET MIGRATION HISTORY - AFTER PUSH"
           echo "=========================================="
 
           supabase migration list
 
       # ============================================================
-      # 17. CHECK EDGE FUNCTIONS IN REPOSITORY
+      # 20. CHECK EDGE FUNCTIONS
       # ============================================================
 
       - name: Check Edge Functions
         run: |
+          set -euo pipefail
+
           echo "=========================================="
           echo "EDGE FUNCTIONS"
           echo "=========================================="
@@ -322,12 +717,12 @@ jobs:
             | sort
 
       # ============================================================
-      # 18. DEPLOY EDGE FUNCTIONS
+      # 21. DEPLOY EDGE FUNCTIONS
       # ============================================================
 
       - name: Deploy Edge Functions
         run: |
-          set -e
+          set -euo pipefail
 
           if [ ! -d "supabase/functions" ]; then
             echo "No Edge Functions directory."
@@ -346,7 +741,7 @@ jobs:
               continue
             fi
 
-            function_name=$(basename "$dir")
+            function_name="$(basename "$dir")"
 
             if [ "$function_name" = "_shared" ]; then
               echo "Skipping _shared"
@@ -356,8 +751,9 @@ jobs:
             found=true
 
             echo ""
-            echo "Deploying:"
-            echo "$function_name"
+            echo "------------------------------------------"
+            echo "Deploying: $function_name"
+            echo "------------------------------------------"
 
             supabase functions deploy "$function_name" \
               --project-ref "$TARGET_PROJECT_REF"
@@ -371,7 +767,7 @@ jobs:
           fi
 
       # ============================================================
-      # 19. STORAGE CONFIGURATION
+      # 22. STORAGE INFORMATION
       # ============================================================
 
       - name: Check Storage Configuration
@@ -380,11 +776,17 @@ jobs:
           echo "STORAGE"
           echo "=========================================="
 
-          echo "Storage bucket/object files are handled separately."
-          echo "Database metadata for storage is included in the schema."
+          echo ""
+          echo "Storage database metadata is included"
+          echo "where supported by the schema migration."
+
+          echo ""
+          echo "IMPORTANT:"
+          echo "Storage bucket OBJECT FILES are NOT copied"
+          echo "by this workflow."
 
       # ============================================================
-      # 20. FINAL MIGRATION SUMMARY
+      # 23. FINAL SUMMARY
       # ============================================================
 
       - name: Migration Summary
@@ -395,32 +797,45 @@ jobs:
           echo "SUPABASE MIGRATION SUMMARY"
           echo "=========================================="
           echo ""
+
           echo "SOURCE:"
           echo "$SOURCE_PROJECT_REF"
+
           echo ""
           echo "TARGET:"
           echo "$TARGET_PROJECT_REF"
+
+          echo ""
+          echo "SOURCE migration repair candidate:"
+          echo "${SOURCE_REPAIR_MIGRATION:-NOT SET}"
+
+          echo ""
+          echo "History repair enabled:"
+          echo "${ALLOW_SOURCE_HISTORY_REPAIR:-false}"
+
           echo ""
           echo "Completed stages:"
-          echo "  Database schema"
-          echo "  PostgreSQL functions"
-          echo "  Triggers"
-          echo "  RLS policies"
-          echo "  Views"
-          echo "  Indexes"
-          echo "  Edge Functions"
+          echo "  ✓ SOURCE migration history check"
+          echo "  ✓ Safe migration history handling"
+          echo "  ✓ SOURCE schema pull"
+          echo "  ✓ Generated migration saved to GitHub"
+          echo "  ✓ TARGET schema push"
+          echo "  ✓ TARGET migration verification"
+          echo "  ✓ Edge Functions deployment"
+
           echo ""
-          echo "Storage OBJECT files are NOT copied by this workflow."
+          echo "Storage OBJECT files:"
+          echo "  NOT copied by this workflow."
+
           echo ""
           echo "=========================================="
 
       # ============================================================
-      # 21. CLEANUP
+      # 24. CLEANUP
       # ============================================================
 
       - name: Cleanup
         if: always()
         run: |
           rm -rf .supabase
-
           echo "Cleanup completed."
